@@ -1,0 +1,419 @@
+'=====================================================================
+'  create_seismic_incl_loads_v6.bas
+'  --------------------------------------------------------------
+'  CONFIRMED on your FEMAP 2022.2 install (via v4/v5 diagnostics):
+'    - LoadDefinition: Ld.setID = <load set ID>, then Ld.Get(i) for
+'      i = 1, 2, 3... using the LOCAL per-set numbering shown in the
+'      tree (e.g. def 1 = "Idlers (middle)").
+'    - LoadMesh: Lm.setID = <load set ID>, then Lm.Get(i) for a FLAT
+'      GLOBAL index i = 1..totalRecordsInSet. Each record reports
+'      which definition it belongs to via Lm.LoadDefinitionID
+'      (read-only output, matches the local def index from above).
+'    - load(0)=Fx, load(1)=Fy, load(2)=Fz confirmed by matching your
+'      screenshot value exactly (Walkway 36, Fz=-606.6667).
+'
+'  STILL UNCONFIRMED (this is what Stage 1 / one-def test is for):
+'    - Creating a new LoadDefinition (Ld.Put) and new LoadMesh
+'      records (Lm.Put) with a target setID - the read side is
+'      proven, the write side is not yet.
+'
+'  --------------------------------------------------------------
+'  RUN IN ORDER (edit RUN_MODE in Init, below):
+'    RUN_MODE = 0  dry run  - reads + reports only, changes nothing.
+'    RUN_MODE = 1  builds ONLY the first definition x 4 sets.
+'    RUN_MODE = 2  full run - all definitions x 4 sets.
+'
+'  Before the full run, delete the definitions you made by hand in
+'  Egx (set 3) so it builds cleanly.
+'=====================================================================
+
+Option Explicit
+
+Dim App As femap.model
+Dim gCreated As Long
+
+Dim DEAD_SET_ID As Long
+Dim FACTOR_EG   As Double
+Dim FACTOR_IN   As Double
+Dim RUN_MODE    As Long
+
+Dim tTitle  As Variant
+Dim tSetID  As Variant
+Dim tAxis   As Variant
+Dim tFactor As Variant
+
+' data read from the dead-load set
+Dim nDef As Long
+Dim dDefID()    As Long
+Dim dDefTitle() As String
+Dim dDefCount() As Long
+Dim nLM As Long
+Dim lmDefIdx() As Long   ' local def index (1..nDef), matches dDefID
+Dim lmNode()   As Long
+Dim lmFz()     As Double
+
+
+Sub Init()
+    Set App = feFemap()
+    gCreated = 0
+
+    '--- EDIT THESE FOUR LINES AS NEEDED ---------------------------
+    DEAD_SET_ID = 1
+    FACTOR_EG   = 21.2021
+    FACTOR_IN   = 250#
+    RUN_MODE    = 0
+    '---------------------------------------------------------------
+
+    tTitle  = Array("Egx", "Egy", "Inx", "Iny")
+    tSetID  = Array(0,     0,     0,     0)   ' 0 = create a fresh set. Do NOT pin Egx to 3.
+    tAxis   = Array(0,     1,     0,     1)
+    tFactor = Array(FACTOR_EG, FACTOR_EG, FACTOR_IN, FACTOR_IN)
+End Sub
+
+
+Sub Log(msg As String)
+    App.feAppMessage(FCM_NORMAL, msg)
+End Sub
+
+
+'--- read all definitions in DEAD_SET_ID (local numbering 1..N) -----
+Sub ReadDefinitions()
+    Dim Ld As femap.LoadDefinition
+    Dim i As Long
+    Dim rc As Long
+
+    Set Ld = App.feLoadDefinition
+    Ld.setID = DEAD_SET_ID
+
+    nDef = 0
+    ReDim dDefID(0 To 200)
+    ReDim dDefTitle(0 To 200)
+    ReDim dDefCount(0 To 200)
+
+    For i = 1 To 200
+        rc = Ld.Get(i)
+        If rc = FE_OK Then
+            dDefID(nDef)    = i
+            dDefTitle(nDef) = Ld.title
+            dDefCount(nDef) = Ld.CountLoads()
+            nDef = nDef + 1
+        End If
+    Next
+End Sub
+
+
+'--- read every load record in the set, bucket by definition --------
+Sub ReadLoadRecords()
+    Dim Lm As femap.LoadMesh
+    Dim totalCount As Long
+    Dim i As Long
+    Dim d As Long
+
+    totalCount = 0
+    For d = 0 To nDef - 1
+        totalCount = totalCount + dDefCount(d)
+    Next
+
+    ReDim lmDefIdx(0 To totalCount + 10)
+    ReDim lmNode(0 To totalCount + 10)
+    ReDim lmFz(0 To totalCount + 10)
+    nLM = 0
+
+    Set Lm = App.feLoadMesh
+    Lm.setID = DEAD_SET_ID
+
+    For i = 1 To totalCount
+        If Lm.Get(i) = FE_OK Then
+            lmDefIdx(nLM) = Lm.LoadDefinitionID
+            lmNode(nLM)   = Lm.meshID
+            lmFz(nLM)     = Lm.load(2)
+            nLM = nLM + 1
+        Else
+            Log "  !! Lm.Get(" & i & ") failed unexpectedly (expected total=" & totalCount & ")"
+        End If
+    Next
+End Sub
+
+
+Sub Stage0_DryRun()
+    Dim d As Long
+    Dim j As Long
+    Dim cnt As Long
+    Dim fzMin As Double
+    Dim fzMax As Double
+    Dim first As Boolean
+    Dim tag As String
+    Dim fz0 As Double
+    Dim t As Long
+    Dim ax As String
+    Dim ls As femap.LoadSet
+
+    Log "===== STAGE 0 : DRY RUN (no changes are made) ====="
+
+    Set ls = App.feLoadSet
+    If ls.Get(DEAD_SET_ID) = FE_OK Then
+        Log "Dead-load set " & DEAD_SET_ID & " = '" & ls.title & "'"
+    Else
+        Log "!! Cannot read load set ID " & DEAD_SET_ID & ". Stopping."
+        Exit Sub
+    End If
+
+    ReadDefinitions
+    Log "Definitions found: " & nDef
+
+    ReadLoadRecords
+    Log "Load records read: " & nLM
+
+    For d = 0 To nDef - 1
+        cnt = 0
+        first = True
+        For j = 0 To nLM - 1
+            If lmDefIdx(j) = dDefID(d) Then
+                cnt = cnt + 1
+                If first = True Then
+                    fzMin = lmFz(j)
+                    fzMax = lmFz(j)
+                    first = False
+                Else
+                    If lmFz(j) < fzMin Then
+                        fzMin = lmFz(j)
+                    End If
+                    If lmFz(j) > fzMax Then
+                        fzMax = lmFz(j)
+                    End If
+                End If
+            End If
+        Next
+        If cnt = 0 Then
+            tag = "*** NO RECORDS MATCHED (mismatch) ***"
+        ElseIf Abs(fzMax - fzMin) < 0.0001 Then
+            tag = "Fz=" & Format(fzMin, "0.####") & "  (uniform)"
+        Else
+            tag = "Fz=" & Format(fzMin, "0.####") & " .. " & Format(fzMax, "0.####") & "  *** NON-UNIFORM ***"
+        End If
+        Log "  [" & dDefID(d) & "] " & dDefTitle(d) & "   expected=" & dDefCount(d) & " matched=" & cnt & "   " & tag
+    Next
+
+    Log "--- preview (definition 1, first node) ---"
+    fz0 = 0#
+    For j = 0 To nLM - 1
+        If lmDefIdx(j) = dDefID(0) Then
+            fz0 = lmFz(j)
+            Exit For
+        End If
+    Next
+    For t = 0 To 3
+        If tAxis(t) = 0 Then
+            ax = "Fx"
+        Else
+            ax = "Fy"
+        End If
+        Log "   " & tTitle(t) & ": " & ax & " = |" & Format(fz0, "0.####") & "| / " & tFactor(t) & " = " & Format(Abs(fz0) / tFactor(t), "0.######")
+    Next
+
+    Log "===== dry run OK. If this matches FEMAP, set RUN_MODE=1 and re-run. ====="
+    MsgBox "Dry run complete - see Messages window. Nothing was changed."
+End Sub
+
+
+'--- count how many definitions currently exist in a load set -------
+Function CountDefsInSet(setID As Long) As Long
+    Dim Ld As femap.LoadDefinition
+    Dim i As Long
+    Dim n As Long
+
+    If setID <= 0 Then
+        CountDefsInSet = 0
+        Exit Function
+    End If
+
+    Set Ld = App.feLoadDefinition
+    Ld.setID = setID
+    n = 0
+    For i = 1 To 200
+        If Ld.Get(i) = FE_OK Then
+            n = n + 1
+        End If
+    Next
+    CountDefsInSet = n
+End Function
+
+
+'--- create one target definition + its load records -----------------
+Function BuildOneDef(d As Long, t As Long) As Long
+    Dim newTitle As String
+    Dim Ld As femap.LoadDefinition
+    Dim newDefID As Long
+    Dim axis As Long
+    Dim fac As Double
+    Dim Lm As femap.LoadMesh
+    Dim c As Long
+    Dim j As Long
+    Dim mag As Double
+    Dim axName As String
+
+    newTitle = tTitle(t) & dDefID(d) & " - " & dDefTitle(d)
+
+    Set Ld = App.feLoadDefinition
+    Ld.setID = CLng(tSetID(t))
+    newDefID = Ld.NextEmptyID
+    If Ld.PutAll(newDefID, 13, FLT_NFORCE, newTitle) <> FE_OK Then
+        Log "  !! failed to create definition (PutAll): " & newTitle
+        BuildOneDef = 0
+        Exit Function
+    End If
+    Ld.Active = newDefID
+
+    axis = CLng(tAxis(t))
+    fac  = CDbl(tFactor(t))
+
+    Set Lm = App.feLoadMesh
+    Lm.setID = CLng(tSetID(t))
+    c = 0
+    For j = 0 To nLM - 1
+        If lmDefIdx(j) = dDefID(d) Then
+            mag = Abs(lmFz(j)) / fac
+            Lm.LoadDefinitionID = newDefID
+            Lm.type    = FLT_NFORCE
+            Lm.meshID  = lmNode(j)
+            Lm.dof(0) = 1
+            Lm.dof(1) = 1
+            Lm.dof(2) = 1
+            Lm.load(0) = 0#
+            Lm.load(1) = 0#
+            Lm.load(2) = 0#
+            If axis = 0 Then
+                Lm.load(0) = mag
+            Else
+                Lm.load(1) = mag
+            End If
+            If Lm.Put(Lm.NextEmptyID) = FE_OK Then
+                c = c + 1
+            End If
+        End If
+    Next
+
+    If axis = 0 Then
+        axName = "Fx"
+    Else
+        axName = "Fy"
+    End If
+    Log "  + " & newTitle & "   (" & c & "/" & dDefCount(d) & " loads, " & axName & " = |Fz|/" & fac & ")"
+
+    ' verify: CountLoads on the new definition MUST equal c.
+    ' If it reads 0, the records are orphaned and Edit Load will not open.
+    Dim Ld2 As femap.LoadDefinition
+    Set Ld2 = App.feLoadDefinition
+    Ld2.setID = CLng(tSetID(t))
+    If Ld2.Get(newDefID) = FE_OK Then
+        If Ld2.CountLoads() = c Then
+            Log "      verify OK: dataType=" & Ld2.dataType & " CountLoads=" & Ld2.CountLoads() & " (matches " & c & ")"
+        Else
+            Log "      !! VERIFY FAILED: dataType=" & Ld2.dataType & " CountLoads=" & Ld2.CountLoads() & " but wrote " & c & " records - definition is orphaned"
+        End If
+    Else
+        Log "      !! could not read back definition " & newDefID
+    End If
+
+    BuildOneDef = c
+End Function
+
+
+Sub ProcessAll(maxDefs As Long)
+    Dim t As Long
+    Dim ls As femap.LoadSet
+    Dim newID As Long
+    Dim nProc As Long
+    Dim d As Long
+
+    If nLM = 0 Then
+        ReadDefinitions
+        ReadLoadRecords
+    End If
+    If nLM = 0 Then
+        Log "!! No dead-load data to process. Stopping."
+        Exit Sub
+    End If
+
+    For t = 0 To 3
+        If CLng(tSetID(t)) <= 0 Then
+            Set ls = App.feLoadSet
+            newID = App.Info_NextID(FT_LOAD_DIR)
+            ls.title = CStr(tTitle(t))
+            If ls.Put(newID) = FE_OK Then
+                tSetID(t) = newID
+                Log "Created load set '" & tTitle(t) & "' as ID " & newID
+            Else
+                Log "!! failed to create set '" & tTitle(t) & "'"
+            End If
+        Else
+            Log "Using existing set ID " & tSetID(t) & " for '" & tTitle(t) & "'"
+        End If
+    Next
+
+    ' --- safety: refuse to build into a set that already has content ---
+    For t = 0 To 3
+        If CountDefsInSet(CLng(tSetID(t))) > 0 Then
+            Log "!! ABORT: set " & tSetID(t) & " ('" & tTitle(t) & "') already contains " & CountDefsInSet(CLng(tSetID(t))) & " definition(s)."
+            Log "   Delete them first, or you will get duplicates. Nothing further was created."
+            MsgBox "ABORT: '" & tTitle(t) & "' already has definitions in it. Delete them and re-run."
+            Exit Sub
+        End If
+    Next
+
+    nProc = nDef
+    If maxDefs > 0 Then
+        If maxDefs < nProc Then
+            nProc = maxDefs
+        End If
+    End If
+
+    Dim skipped As Long
+    skipped = 0
+    For d = 0 To nProc - 1
+        Dim hasRecords As Long
+        hasRecords = 0
+        Dim j As Long
+        For j = 0 To nLM - 1
+            If lmDefIdx(j) = dDefID(d) Then
+                hasRecords = 1
+                Exit For
+            End If
+        Next
+        If hasRecords = 1 Then
+            For t = 0 To 3
+                gCreated = gCreated + BuildOneDef(d, t)
+            Next
+        Else
+            Log "  ~ SKIPPED [" & dDefID(d) & "] " & dDefTitle(d) & "  (no LoadMesh records found - different load type, e.g. rigid/connector load. Create its 4 loads by hand.)"
+            skipped = skipped + 1
+        End If
+    Next
+    If skipped > 0 Then
+        Log "!! " & skipped & " definition(s) skipped - see lines above. These need manual Egx/Egy/Inx/Iny loads."
+    End If
+
+    Log "Done. Definitions processed: " & nProc & " x 4.  Load records created: " & gCreated
+    MsgBox "Finished." & Chr$(13) & "Definitions processed: " & nProc & " x 4 sets" & Chr$(13) & "Load records created: " & gCreated & Chr$(13) & "See the Messages window for the full log."
+End Sub
+
+
+Sub Main
+    Init
+    Log ""
+    Log "########## Seismic / inclination load generator (v12) ##########"
+    Select Case RUN_MODE
+        Case 0
+            Stage0_DryRun
+        Case 1
+            Stage0_DryRun
+            Log "----- STAGE 1 : ONE definition x 4 sets -----"
+            ProcessAll 1
+        Case 2
+            Stage0_DryRun
+            Log "----- STAGE 2 : FULL run, all definitions x 4 sets -----"
+            ProcessAll 0
+        Case Else
+            Log "RUN_MODE must be 0, 1 or 2."
+    End Select
+End Sub
