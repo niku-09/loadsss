@@ -1,0 +1,154 @@
+' ===== Stage 2: Build matched element set + compute tributary node areas =====
+Dim matchedElemIDs() As Long
+Dim nMatchedElems As Long
+Dim nodeArea As Object   ' Scripting.Dictionary: nodeID -> cumulative tributary area
+
+Sub Stage2_BuildTributaryAreas()
+    Dim App As femap.model
+    Set App = feFemap
+    Dim oElem As femap.Elem
+    Set oElem = App.feElem
+
+    Set nodeArea = CreateObject("Scripting.Dictionary")
+
+    Dim cosTol As Double
+    cosTol = Cos(ANGLE_TOL_DEG * 3.14159265 / 180)
+
+    ReDim matchedElemIDs(1 To 50000)   ' generous upper bound, trimmed later
+    nMatchedElems = 0
+
+    Dim nodeIDs(1 To 4) As Long, nNodes As Integer
+
+    If oElem.First Then
+        Do
+            If oElem.type = 8 Then   ' VERIFY plate/shell constant via recorded macro
+                nNodes = oElem.NodeList(nodeIDs)   ' VERIFY signature
+
+                If nNodes >= 3 Then
+                    Dim nx As Double, ny As Double, nz As Double
+                    If GetElemNormal(nodeIDs, nNodes, App, nx, ny, nz) Then
+                        Dim comp As Double
+                        comp = IIf(TARGET_AXIS = 1, nx, ny)
+
+                        Dim isMatch As Boolean
+                        isMatch = False
+                        If TARGET_SIGN > 0 Then
+                            If comp >= cosTol Then isMatch = True
+                        Else
+                            If comp <= -cosTol Then isMatch = True
+                        End If
+
+                        If isMatch Then
+                            nMatchedElems = nMatchedElems + 1
+                            matchedElemIDs(nMatchedElems) = oElem.ID
+
+                            Dim area As Double
+                            area = ElemFaceArea(nodeIDs, nNodes, App)   ' shoelace/cross-product, see below
+
+                            Dim shareArea As Double
+                            shareArea = area / nNodes   ' split face area evenly to its own corners
+
+                            Dim k As Integer
+                            For k = 1 To nNodes
+                                Dim nID As String
+                                nID = CStr(nodeIDs(k))
+                                If nodeArea.Exists(nID) Then
+                                    nodeArea(nID) = nodeArea(nID) + shareArea
+                                Else
+                                    nodeArea.Add nID, shareArea
+                                End If
+                            Next k
+                        End If
+                    End If
+                End If
+            End If
+        Loop While oElem.Next
+    End If
+
+    ReDim Preserve matchedElemIDs(1 To nMatchedElems)
+
+    MsgBox "Matched elements: " & nMatchedElems & vbCrLf & _
+           "Unique windward nodes: " & nodeArea.Count
+End Sub
+
+' ===== Helper: planar face area via cross-product (handles tri or quad) =====
+Function ElemFaceArea(nodeIDs() As Long, nCount As Integer, App As femap.model) As Double
+    Dim oNode As femap.Node
+    Set oNode = App.feNode
+    Dim px(1 To 4) As Double, py(1 To 4) As Double, pz(1 To 4) As Double
+    Dim i As Integer
+
+    For i = 1 To nCount
+        oNode.Get nodeIDs(i)
+        px(i) = oNode.x : py(i) = oNode.y : pz(i) = oNode.z
+    Next i
+
+    ' Sum of cross products of consecutive edge vectors from a reference point, /2
+    Dim sx As Double, sy As Double, sz As Double
+    sx = 0 : sy = 0 : sz = 0
+    For i = 2 To nCount - 1
+        Dim ax As Double, ay As Double, az As Double
+        Dim bx As Double, by As Double, bz As Double
+        ax = px(i) - px(1) : ay = py(i) - py(1) : az = pz(i) - pz(1)
+        bx = px(i + 1) - px(1) : by = py(i + 1) - py(1) : bz = pz(i + 1) - pz(1)
+        sx = sx + (ay * bz - az * by)
+        sy = sy + (az * bx - ax * bz)
+        sz = sz + (ax * by - ay * bx)
+    Next i
+
+    ElemFaceArea = 0.5 * Sqr(sx * sx + sy * sy + sz * sz)
+End Function
+
+' ===== Stage 3: Apply nodal forces proportional to tributary area =====
+Sub Stage3_ApplyWindLoad()
+    Dim totalArea As Double
+    Dim key As Variant
+    totalArea = 0
+    For Each key In nodeArea.Keys
+        totalArea = totalArea + nodeArea(key)
+    Next key
+
+    If totalArea <= 0 Then
+        MsgBox "No tributary area computed - run Stage 2 first."
+        Exit Sub
+    End If
+
+    Dim totalForce As Double
+    totalForce = IIf(TARGET_AXIS = 1, 665552.8, 397276.8)   ' Wx or Wy, per your calc
+
+    Dim forceDir As Double
+    forceDir = TARGET_SIGN   ' force pushes in the direction wind travels (opposite the face normal you selected on)
+    ' NOTE: confirm sign convention - windward face normal points INTO the wind (toward -wind),
+    ' so the applied force is usually -TARGET_SIGN * totalForce along the axis. Verify against
+    ' an existing manually-applied Wx/Wy load definition entry before running on the full model.
+
+    Dim App As femap.model
+    Set App = feFemap
+    Dim oLoadMesh As femap.LoadMesh
+    Set oLoadMesh = App.feLoadMesh
+
+    Dim fnum As Integer
+    fnum = FreeFile
+    Open LOG_PATH For Append As #fnum
+    Print #fnum, "--- Stage 3 Apply ---"
+    Print #fnum, "NodeID" & vbTab & "TribArea" & vbTab & "ForceApplied"
+
+    For Each key In nodeArea.Keys
+        Dim nodeForce As Double
+        nodeForce = totalForce * (nodeArea(key) / totalArea) * (-forceDir)
+
+        Dim fx As Double, fy As Double, fz As Double
+        fx = 0 : fy = 0 : fz = 0
+        If TARGET_AXIS = 1 Then fx = nodeForce Else fy = nodeForce
+
+        ' PutAll signature per your v12 script: dataType MUST be 13, not FT_NODE
+        oLoadMesh.PutAll CLng(key), 13, 0, LOAD_SET_ID, "", fx, fy, fz, 0, 0, 0
+        ' VERIFY exact PutAll arg order/count against a recorded macro on ONE node first
+
+        Print #fnum, key & vbTab & Format(nodeArea(key), "0.00") & vbTab & Format(nodeForce, "0.0")
+    Next key
+
+    Close #fnum
+    MsgBox "Applied " & totalForce & " N total across " & nodeArea.Count & " nodes." & vbCrLf & _
+           "Log appended: " & LOG_PATH
+End Sub
