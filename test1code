@@ -1,96 +1,212 @@
-' ===== Stage 2: Build matched element set + compute tributary node areas =====
+Option Explicit
+
+' ============================================================
+'  Wind load auto-selection (Wx / Wy) - staged
+'  Stage0  config
+'  Stage0b API probe  <-- RUN THIS FIRST
+'  Stage1  diagnostic scan (no model changes)
+'  Stage2  build matched set + tributary areas
+'  Stage3  apply nodal forces
+' ============================================================
+
+' ---- ALL module-level declarations at top ----
+Dim TARGET_AXIS As Integer
+Dim TARGET_SIGN As Integer
+Dim ANGLE_TOL_DEG As Double
+Dim LOAD_SET_ID As Long
+Dim TOTAL_FORCE As Double
+Dim LOG_PATH As String
+
 Dim matchedElemIDs() As Long
 Dim nMatchedElems As Long
-Dim nodeArea As Object   ' Scripting.Dictionary: nodeID -> cumulative tributary area
+Dim nodeArea As Object
+Dim configDone As Boolean
+Dim stage2Done As Boolean
 
-Sub Stage2_BuildTributaryAreas()
+Const WX_FORCE As Double = 665552.8
+Const WY_FORCE As Double = 397276.8
+Const FE_OK As Integer = -1
+Const PLATE_TYPE As Integer = 8      ' UNVERIFIED - Stage0b will tell you the real value
+
+
+Sub Main()
+    Stage0_Config
+    MsgBox "Config loaded." & vbCrLf & vbCrLf & _
+           "Now run Stage0b_ApiProbe from the Sub list to verify " & _
+           "element type and node-list access before anything else."
+End Sub
+
+
+' ============================================================
+Sub Stage0_Config()
+    Dim resp As String
+
+    resp = InputBox("Target axis  (X = along rail / Wx,  Y = across rail / Wy)", "Axis", "X")
+    If UCase(resp) = "X" Then
+        TARGET_AXIS = 1
+        TOTAL_FORCE = WX_FORCE
+        LOAD_SET_ID = 9
+    Else
+        TARGET_AXIS = 2
+        TOTAL_FORCE = WY_FORCE
+        LOAD_SET_ID = 10
+    End If
+
+    resp = InputBox("Windward face normal sign  (+1 or -1)", "Side", "-1")
+    TARGET_SIGN = CInt(resp)
+
+    resp = InputBox("Angle tolerance from axis, degrees", "Tolerance", "30")
+    ANGLE_TOL_DEG = CDbl(resp)
+
+    resp = InputBox("Load Set ID", "Load Set", CStr(LOAD_SET_ID))
+    LOAD_SET_ID = CLng(resp)
+
+    LOG_PATH = "C:\FEMAP_Automation\WindSelect_" & Format(Now, "yyyymmdd_hhnnss") & ".log"
+    configDone = True
+End Sub
+
+
+' ============================================================
+'  Stage0b - dump raw API data for the first 15 elements so we can
+'  confirm the type constant and how to read the node list.
+'  Makes NO changes to the model.
+' ============================================================
+Sub Stage0b_ApiProbe()
     Dim App As femap.model
     Set App = feFemap
+
     Dim oElem As femap.Elem
     Set oElem = App.feElem
 
-    Set nodeArea = CreateObject("Scripting.Dictionary")
+    Dim msg As String
+    Dim count As Integer
+    count = 0
 
-    Dim cosTol As Double
-    cosTol = Cos(ANGLE_TOL_DEG * 3.14159265 / 180)
+    msg = "ID / type / topology / first node IDs" & vbCrLf & vbCrLf
 
-    ReDim matchedElemIDs(1 To 50000)   ' generous upper bound, trimmed later
-    nMatchedElems = 0
-
-    Dim nodeIDs(1 To 4) As Long, nNodes As Integer
-
-    If oElem.First Then
+    If oElem.First = FE_OK Then
         Do
-            If oElem.type = 8 Then   ' VERIFY plate/shell constant via recorded macro
-                nNodes = oElem.NodeList(nodeIDs)   ' VERIFY signature
+            count = count + 1
 
-                If nNodes >= 3 Then
-                    Dim nx As Double, ny As Double, nz As Double
-                    If GetElemNormal(nodeIDs, nNodes, App, nx, ny, nz) Then
-                        Dim comp As Double
-                        comp = IIf(TARGET_AXIS = 1, nx, ny)
+            Dim v As Variant
+            Dim nodeStr As String
+            Dim i As Integer
 
-                        Dim isMatch As Boolean
-                        isMatch = False
-                        If TARGET_SIGN > 0 Then
-                            If comp >= cosTol Then isMatch = True
-                        Else
-                            If comp <= -cosTol Then isMatch = True
-                        End If
-
-                        If isMatch Then
-                            nMatchedElems = nMatchedElems + 1
-                            matchedElemIDs(nMatchedElems) = oElem.ID
-
-                            Dim area As Double
-                            area = ElemFaceArea(nodeIDs, nNodes, App)   ' shoelace/cross-product, see below
-
-                            Dim shareArea As Double
-                            shareArea = area / nNodes   ' split face area evenly to its own corners
-
-                            Dim k As Integer
-                            For k = 1 To nNodes
-                                Dim nID As String
-                                nID = CStr(nodeIDs(k))
-                                If nodeArea.Exists(nID) Then
-                                    nodeArea(nID) = nodeArea(nID) + shareArea
-                                Else
-                                    nodeArea.Add nID, shareArea
-                                End If
-                            Next k
-                        End If
-                    End If
-                End If
+            nodeStr = ""
+            On Error Resume Next
+            v = oElem.vnode
+            If Err.Number = 0 Then
+                For i = 0 To 7
+                    nodeStr = nodeStr & CStr(v(i)) & " "
+                Next i
+            Else
+                nodeStr = "<vnode failed: " & Err.Description & ">"
+                Err.Clear
             End If
-        Loop While oElem.Next
+            On Error GoTo 0
+
+            msg = msg & oElem.ID & " / " & oElem.type & " / " & _
+                  oElem.topology & " / " & nodeStr & vbCrLf
+
+            If count >= 15 Then Exit Do
+        Loop While oElem.Next = FE_OK
     End If
 
-    ReDim Preserve matchedElemIDs(1 To nMatchedElems)
-
-    MsgBox "Matched elements: " & nMatchedElems & vbCrLf & _
-           "Unique windward nodes: " & nodeArea.Count
+    MsgBox msg
 End Sub
 
-' ===== Helper: planar face area via cross-product (handles tri or quad) =====
+
+' ============================================================
+'  Newell's method face normal.  nodeIDs must be a DYNAMIC array.
+' ============================================================
+Function GetElemNormal(nodeIDs() As Long, nCount As Integer, App As femap.model, _
+                       ByRef nx As Double, ByRef ny As Double, ByRef nz As Double) As Boolean
+
+    Dim oNode As femap.Node
+    Set oNode = App.feNode
+
+    Dim px(1 To 4) As Double
+    Dim py(1 To 4) As Double
+    Dim pz(1 To 4) As Double
+    Dim i As Integer
+    Dim j As Integer
+
+    For i = 1 To nCount
+        If oNode.Get(nodeIDs(i)) <> FE_OK Then
+            GetElemNormal = False
+            Exit Function
+        End If
+        px(i) = oNode.x
+        py(i) = oNode.y
+        pz(i) = oNode.z
+    Next i
+
+    nx = 0
+    ny = 0
+    nz = 0
+
+    For i = 1 To nCount
+        j = (i Mod nCount) + 1
+        nx = nx + (py(i) - py(j)) * (pz(i) + pz(j))
+        ny = ny + (pz(i) - pz(j)) * (px(i) + px(j))
+        nz = nz + (px(i) - px(j)) * (py(i) + py(j))
+    Next i
+
+    Dim mag As Double
+    mag = Sqr(nx * nx + ny * ny + nz * nz)
+
+    If mag < 0.000001 Then
+        GetElemNormal = False
+    Else
+        nx = nx / mag
+        ny = ny / mag
+        nz = nz / mag
+        GetElemNormal = True
+    End If
+End Function
+
+
+' ============================================================
 Function ElemFaceArea(nodeIDs() As Long, nCount As Integer, App As femap.model) As Double
     Dim oNode As femap.Node
     Set oNode = App.feNode
-    Dim px(1 To 4) As Double, py(1 To 4) As Double, pz(1 To 4) As Double
+
+    Dim px(1 To 4) As Double
+    Dim py(1 To 4) As Double
+    Dim pz(1 To 4) As Double
     Dim i As Integer
 
     For i = 1 To nCount
-        oNode.Get nodeIDs(i)
-        px(i) = oNode.x : py(i) = oNode.y : pz(i) = oNode.z
+        If oNode.Get(nodeIDs(i)) <> FE_OK Then
+            ElemFaceArea = 0
+            Exit Function
+        End If
+        px(i) = oNode.x
+        py(i) = oNode.y
+        pz(i) = oNode.z
     Next i
 
-    ' Sum of cross products of consecutive edge vectors from a reference point, /2
-    Dim sx As Double, sy As Double, sz As Double
-    sx = 0 : sy = 0 : sz = 0
+    Dim sx As Double
+    Dim sy As Double
+    Dim sz As Double
+    Dim ax As Double
+    Dim ay As Double
+    Dim az As Double
+    Dim bx As Double
+    Dim by As Double
+    Dim bz As Double
+
+    sx = 0
+    sy = 0
+    sz = 0
+
     For i = 2 To nCount - 1
-        Dim ax As Double, ay As Double, az As Double
-        Dim bx As Double, by As Double, bz As Double
-        ax = px(i) - px(1) : ay = py(i) - py(1) : az = pz(i) - pz(1)
-        bx = px(i + 1) - px(1) : by = py(i + 1) - py(1) : bz = pz(i + 1) - pz(1)
+        ax = px(i) - px(1)
+        ay = py(i) - py(1)
+        az = pz(i) - pz(1)
+        bx = px(i + 1) - px(1)
+        by = py(i + 1) - py(1)
+        bz = pz(i + 1) - pz(1)
         sx = sx + (ay * bz - az * by)
         sy = sy + (az * bx - ax * bz)
         sz = sz + (ax * by - ay * bx)
@@ -99,56 +215,96 @@ Function ElemFaceArea(nodeIDs() As Long, nCount As Integer, App As femap.model) 
     ElemFaceArea = 0.5 * Sqr(sx * sx + sy * sy + sz * sz)
 End Function
 
-' ===== Stage 3: Apply nodal forces proportional to tributary area =====
-Sub Stage3_ApplyWindLoad()
-    Dim totalArea As Double
-    Dim key As Variant
-    totalArea = 0
-    For Each key In nodeArea.Keys
-        totalArea = totalArea + nodeArea(key)
-    Next key
 
-    If totalArea <= 0 Then
-        MsgBox "No tributary area computed - run Stage 2 first."
+' ============================================================
+Sub Stage1_Diagnostic()
+    If Not configDone Then
+        MsgBox "Run Stage0_Config first."
         Exit Sub
     End If
 
-    Dim totalForce As Double
-    totalForce = IIf(TARGET_AXIS = 1, 665552.8, 397276.8)   ' Wx or Wy, per your calc
-
-    Dim forceDir As Double
-    forceDir = TARGET_SIGN   ' force pushes in the direction wind travels (opposite the face normal you selected on)
-    ' NOTE: confirm sign convention - windward face normal points INTO the wind (toward -wind),
-    ' so the applied force is usually -TARGET_SIGN * totalForce along the axis. Verify against
-    ' an existing manually-applied Wx/Wy load definition entry before running on the full model.
-
     Dim App As femap.model
     Set App = feFemap
-    Dim oLoadMesh As femap.LoadMesh
-    Set oLoadMesh = App.feLoadMesh
+    Dim oElem As femap.Elem
+    Set oElem = App.feElem
+
+    Dim cosTol As Double
+    cosTol = Cos(ANGLE_TOL_DEG * 3.14159265 / 180)
+
+    Dim nodeIDs() As Long
+    ReDim nodeIDs(1 To 4)
 
     Dim fnum As Integer
     fnum = FreeFile
-    Open LOG_PATH For Append As #fnum
-    Print #fnum, "--- Stage 3 Apply ---"
-    Print #fnum, "NodeID" & vbTab & "TribArea" & vbTab & "ForceApplied"
+    Open LOG_PATH For Output As #fnum
+    Print #fnum, "ElemID" & vbTab & "nx" & vbTab & "ny" & vbTab & "nz" & vbTab & "Matched"
 
-    For Each key In nodeArea.Keys
-        Dim nodeForce As Double
-        nodeForce = totalForce * (nodeArea(key) / totalArea) * (-forceDir)
+    Dim nTotal As Long
+    Dim nMatched As Long
+    Dim nSkippedType As Long
+    Dim nBadNormal As Long
+    Dim nNodes As Integer
+    Dim nx As Double
+    Dim ny As Double
+    Dim nz As Double
+    Dim comp As Double
+    Dim isMatch As Boolean
+    Dim v As Variant
+    Dim k As Integer
 
-        Dim fx As Double, fy As Double, fz As Double
-        fx = 0 : fy = 0 : fz = 0
-        If TARGET_AXIS = 1 Then fx = nodeForce Else fy = nodeForce
+    nTotal = 0
+    nMatched = 0
+    nSkippedType = 0
+    nBadNormal = 0
 
-        ' PutAll signature per your v12 script: dataType MUST be 13, not FT_NODE
-        oLoadMesh.PutAll CLng(key), 13, 0, LOAD_SET_ID, "", fx, fy, fz, 0, 0, 0
-        ' VERIFY exact PutAll arg order/count against a recorded macro on ONE node first
+    If oElem.First = FE_OK Then
+        Do
+            nTotal = nTotal + 1
 
-        Print #fnum, key & vbTab & Format(nodeArea(key), "0.00") & vbTab & Format(nodeForce, "0.0")
-    Next key
+            If oElem.type = PLATE_TYPE Then
+                v = oElem.vnode
+
+                nNodes = 4
+                If v(3) = 0 Then nNodes = 3
+
+                ReDim nodeIDs(1 To nNodes)
+                For k = 1 To nNodes
+                    nodeIDs(k) = CLng(v(k - 1))
+                Next k
+
+                If GetElemNormal(nodeIDs, nNodes, App, nx, ny, nz) Then
+                    If TARGET_AXIS = 1 Then
+                        comp = nx
+                    Else
+                        comp = ny
+                    End If
+
+                    isMatch = False
+                    If TARGET_SIGN > 0 Then
+                        If comp >= cosTol Then isMatch = True
+                    Else
+                        If comp <= -cosTol Then isMatch = True
+                    End If
+
+                    Print #fnum, oElem.ID & vbTab & Format(nx, "0.000") & vbTab & _
+                                 Format(ny, "0.000") & vbTab & Format(nz, "0.000") & _
+                                 vbTab & isMatch
+
+                    If isMatch Then nMatched = nMatched + 1
+                Else
+                    nBadNormal = nBadNormal + 1
+                End If
+            Else
+                nSkippedType = nSkippedType + 1
+            End If
+        Loop While oElem.Next = FE_OK
+    End If
 
     Close #fnum
-    MsgBox "Applied " & totalForce & " N total across " & nodeArea.Count & " nodes." & vbCrLf & _
-           "Log appended: " & LOG_PATH
+
+    MsgBox "Total elements scanned: " & nTotal & vbCrLf & _
+           "Matched (windward): " & nMatched & vbCrLf & _
+           "Skipped (wrong type): " & nSkippedType & vbCrLf & _
+           "Degenerate normal: " & nBadNormal & vbCrLf & vbCrLf & _
+           "Log: " & LOG_PATH
 End Sub
